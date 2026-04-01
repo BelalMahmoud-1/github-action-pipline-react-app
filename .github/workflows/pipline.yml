@@ -1,0 +1,113 @@
+name: React App CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: belalmahmoud81/react-app
+
+jobs:
+  build-test-push-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Setup Node.js 18 ──────────────────────────────────────
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      # ── Install Dependencies ───────────────────────────────────
+      - name: Install Dependencies
+        run: npm install
+
+      # ── Run Tests ─────────────────────────────────────────────
+      - name: Run Tests
+        run: npm test -- --watchAll=false
+
+      # ── Build ─────────────────────────────────────────────────
+      - name: Build
+        run: npm run build
+
+      # ── Archive Artifacts ─────────────────────────────────────
+      - name: Archive Build Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: ignore
+
+      # ── Docker Build ──────────────────────────────────────────
+      - name: Docker Build
+        run: |
+          docker build --no-cache \
+            -t ${{ env.IMAGE_NAME }}:${{ github.run_number }} .
+
+      # ── Docker Login & Push ───────────────────────────────────
+      - name: Docker Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_PASS }}
+
+      - name: Docker Push
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.run_number }} \
+                     ${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.IMAGE_NAME }}:${{ github.run_number }}
+          docker push ${{ env.IMAGE_NAME }}:latest
+
+      # ── Deploy to EC2 via SSH ─────────────────────────────────
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "🚀 Pulling latest image..."
+            docker pull ${{ env.IMAGE_NAME }}:latest
+
+            echo "🛑 Stopping old container..."
+            docker rm -f react-app || true
+
+            echo "▶️ Starting new container..."
+            docker run -d \
+              --name react-app \
+              --restart always \
+              -p 3000:80 \
+              ${{ env.IMAGE_NAME }}:latest
+
+            echo "🧹 Cleaning up old images..."
+            docker image prune -f
+
+            echo "✅ Deployment complete!"
+            docker ps
+
+      # ── Slack - Success ───────────────────────────────────────
+      - name: Slack Notification (Success)
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: '#nodejs-pipline'
+          slack-message: "✅ Build SUCCESS: ${{ github.workflow }} #${{ github.run_number }} - http://${{ secrets.EC2_HOST }}:3000"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # ── Slack - Failure ───────────────────────────────────────
+      - name: Slack Notification (Failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: '#nodejs-pipline'
+          slack-message: "❌ Build FAILED: ${{ github.workflow }} #${{ github.run_number }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
